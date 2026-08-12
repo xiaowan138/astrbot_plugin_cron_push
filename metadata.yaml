@@ -1,0 +1,7 @@
+name: astrbot_plugin_cron_push # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
+display_name: 定时群消息推送（Cron） # 用于展示的名字
+desc: 用 cron 表达式或快捷语法（每日/每周）设置定时任务，到点自动向群发送固定消息。适合每日早安、值班提醒、定时公告。支持手动测试、暂停、恢复、删除，任务持久化重启不丢，可配置时区。纯命令实现，不依赖 LLM。
+version: v1.0.0 # 插件版本号，格式：v1.1.1 或者 v1.1
+author: your_name # 作者（发布前请修改）
+repo: https://github.com/your_name/astrbot_plugin_cron_push # 插件仓库地址（发布前请修改）
+short_desc: cron 定时向群推送消息，支持每日/每周快捷语法

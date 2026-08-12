@@ -1,0 +1,22 @@
+{
+  "check_interval_seconds": {
+    "description": "调度器检查频率（秒，最小 5 秒）",
+    "type": "int",
+    "default": 20
+  },
+  "max_tasks_per_group": {
+    "description": "单个群最多可创建的定时任务数",
+    "type": "int",
+    "default": 10
+  },
+  "max_total_tasks": {
+    "description": "全局最多可创建的定时任务总数",
+    "type": "int",
+    "default": 50
+  },
+  "timezone": {
+    "description": "时区（IANA 格式，如 Asia/Shanghai）。留空则使用服务器本地时区",
+    "type": "string",
+    "default": ""
+  }
+}
