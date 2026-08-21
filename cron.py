@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 WEEKDAY_MAP = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 0, "天": 0}
 
@@ -70,6 +70,17 @@ class CronExpr:
             # 标准 cron：日与周同时受限时，命中其一即算匹配
             return day_match or week_match
         return day_match and week_match
+
+    def find_next(self, dt: datetime, limit_days: int = 366):
+        """返回从 dt（含）之后、最接近的下一个触发时刻；找不到返回 None。"""
+        d = dt.replace(second=0, microsecond=0)
+        end = d + timedelta(days=limit_days)
+        d += timedelta(minutes=1)
+        while d <= end:
+            if self.match(d):
+                return d
+            d += timedelta(minutes=1)
+        return None
 
 
 def _parse_hhmm(s: str) -> tuple[int, int]:
