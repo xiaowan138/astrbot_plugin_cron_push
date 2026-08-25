@@ -14,6 +14,16 @@
     "type": "int",
     "default": 50
   },
+  "max_consecutive_failures": {
+    "description": "连续发送失败达到该次数自动暂停任务（0=不自动暂停）",
+    "type": "int",
+    "default": 3
+  },
+  "list_global": {
+    "description": "开启后 /定时 列表 显示所有会话的任务（默认仅显示当前会话）",
+    "type": "bool",
+    "default": false
+  },
   "timezone": {
     "description": "时区（IANA 格式，如 Asia/Shanghai）。留空则使用服务器本地时区",
     "type": "string",

@@ -56,6 +56,8 @@ class PushTask:
     creator: str = ""
     enabled: bool = True
     last_fired: str = ""  # 最近一次触发的分钟标识，避免重复发送
+    fire_count: int = 0  # 累计触发次数
+    consecutive_failures: int = 0  # 连续发送失败次数
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +68,8 @@ class PushTask:
             "creator": self.creator,
             "enabled": self.enabled,
             "last_fired": self.last_fired,
+            "fire_count": self.fire_count,
+            "consecutive_failures": self.consecutive_failures,
         }
 
 
@@ -154,6 +158,13 @@ class CronPushPlugin(Star):
             return "—"
         return nxt.strftime("%Y-%m-%d %H:%M") if nxt else "—"
 
+    def _max_failures(self) -> int:
+        """连续发送失败达到该次数自动暂停任务；0 表示不自动暂停。"""
+        try:
+            return max(0, int(self._cfg("max_consecutive_failures", 3)))
+        except Exception:
+            return 3
+
     # ---------------- 调度循环 ----------------
 
     def _ensure_scheduler(self) -> None:
@@ -173,13 +184,28 @@ class CronPushPlugin(Star):
                     if not t.enabled or t.last_fired == key:
                         continue
                     try:
-                        if CronExpr(t.cron).match(now):
-                            await self.context.send_message(t.umo, MessageChain().message(self._render(t.message, now)))
-                            t.last_fired = key
-                            await self._save_tasks()
-                            logger.info(f"定时任务 #{t.id} 已发送到 {t.umo}")
+                        matched = CronExpr(t.cron).match(now)
                     except Exception as e:
-                        logger.warning(f"定时任务 #{t.id} 执行失败：{e}")
+                        logger.warning(f"定时任务 #{t.id} cron 无效：{e}")
+                        continue
+                    if not matched:
+                        continue
+                    try:
+                        await self.context.send_message(t.umo, MessageChain().message(self._render(t.message, now)))
+                        t.fire_count += 1
+                        t.consecutive_failures = 0
+                        t.last_fired = key
+                        await self._save_tasks()
+                        logger.info(f"定时任务 #{t.id} 已发送到 {t.umo}")
+                    except Exception as e:
+                        t.consecutive_failures += 1
+                        limit = self._max_failures()
+                        if limit and t.consecutive_failures >= limit:
+                            t.enabled = False
+                            await self._save_tasks()
+                            logger.warning(f"定时任务 #{t.id} 连续失败 {t.consecutive_failures} 次，已自动暂停")
+                        else:
+                            logger.warning(f"定时任务 #{t.id} 执行失败：{e}")
             except Exception:
                 logger.exception("定时任务调度循环异常")
             await asyncio.sleep(max(5, int(self._cfg("check_interval_seconds", 20))))
@@ -245,19 +271,27 @@ class CronPushPlugin(Star):
     @timer_group.command("列表", alias={"list", "查看"})
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def list_tasks(self, event: AstrMessageEvent):
-        """查看所有定时任务"""
+        """查看定时任务"""
         self._ensure_scheduler()
         await self._ensure_loaded()
-        if not self.tasks:
-            yield event.plain_result("📭 暂无定时任务。发送 /定时 新增 <时间>|<消息> 创建。")
+        show_all = bool(self._cfg("list_global", False))
+        if show_all:
+            items = list(self.tasks.values())
+        else:
+            items = [t for t in self.tasks.values() if t.umo == event.unified_msg_origin]
+        if not items:
+            hint = "" if show_all else "（或可在插件配置开启 `list_global` 查看全部会话任务）"
+            yield event.plain_result(f"📭 当前会话暂无定时任务。发送 /定时 新增 <时间>|<消息> 创建任务{hint}。")
             return
         lines = ["⏰ 定时任务列表："]
-        for t in sorted(self.tasks.values(), key=lambda x: x.id):
+        for t in sorted(items, key=lambda x: x.id):
             status = "▶️" if t.enabled else "⏸"
             msg = t.message if len(t.message) <= 24 else t.message[:24] + "…"
             last = t.last_fired.split(" ", 1)[-1] if t.last_fired else "—"
+            when = f"下次 {self._next_fire_str(t.cron)}" if t.enabled else "已暂停"
+            session = f" · {t.umo.split(':', 1)[-1]}" if show_all else ""
             lines.append(f"{status} #{t.id} {t.cron} | {msg}")
-            lines.append(f"    上次 {last} · 下次 {self._next_fire_str(t.cron)} · 创建者 {t.creator or '—'}")
+            lines.append(f"    上次 {last} · {when} · 已触发 {t.fire_count} 次 · 创建者 {t.creator or '—'}{session}")
         lines.append("发送 /定时 帮助 查看操作说明。")
         yield event.plain_result("\n".join(lines))
 
@@ -286,6 +320,8 @@ class CronPushPlugin(Star):
             return
         # 置位 last_fired，避免手动触发与本分钟调度触发重复发送
         t.last_fired = self._now().strftime("%Y-%m-%d %H:%M")
+        t.fire_count += 1
+        t.consecutive_failures = 0
         await self._save_tasks()
         yield event.plain_result(f"✅ 已手动发送任务 #{tid} 的内容。")
 
@@ -314,6 +350,7 @@ class CronPushPlugin(Star):
             yield event.plain_result("❌ 格式：/定时 启用 <编号>，用 /定时 列表 查看编号。")
             return
         self.tasks[tid].enabled = True
+        self.tasks[tid].consecutive_failures = 0
         await self._save_tasks()
         yield event.plain_result(f"▶️ 已启用任务 #{tid}。")
 
