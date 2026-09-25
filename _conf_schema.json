@@ -24,6 +24,21 @@
     "type": "bool",
     "default": false
   },
+  "allow_cross_session": {
+    "description": "允许管理员跨会话操作任务（默认关闭，即只能管理本会话的任务）",
+    "type": "bool",
+    "default": false
+  },
+  "catch_up": {
+    "description": "开启后，插件启动时补发离线期间错过的任务（每个任务最多补发一次）",
+    "type": "bool",
+    "default": false
+  },
+  "catch_up_max_hours": {
+    "description": "补发窗口上限（小时），仅补发该时间范围内错过的任务",
+    "type": "int",
+    "default": 6
+  },
   "timezone": {
     "description": "时区（IANA 格式，如 Asia/Shanghai）。留空则使用服务器本地时区",
     "type": "string",

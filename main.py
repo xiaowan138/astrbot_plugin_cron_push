@@ -9,12 +9,14 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
-from datetime import datetime
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Optional
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import MessageChain, filter, AstrMessageEvent
+from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star
 
 from .cron import CronExpr, parse_schedule
@@ -24,7 +26,7 @@ try:
 except ImportError:  # pragma: no cover
     ZoneInfo = None
 
-HELP_TEXT = """⏰ 定时群消息推送 · 使用帮助
+HELP_TEXT = """⏰ 定时消息推送 · 使用帮助
 【新增任务】
   /定时 新增 <时间>|<消息内容>
     时间支持 3 种写法：
@@ -34,15 +36,19 @@ HELP_TEXT = """⏰ 定时群消息推送 · 使用帮助
     例：/定时 新增 每日 08:00|早上好，记得喝水哦
     例：/定时 新增 0 9 * * 1|周一晨会提醒
     消息里可用占位符：{{time}} 当前 HH:MM、{{date}} 今日日期、{{datetime}} 日期+时间
-【管理】（新增/编辑/改时/删除/暂停/启用/立即 仅管理员或操作者本人可用）
-  /定时 列表            查看所有任务（含上次/下次触发时间）
+                     {{at:QQ号}} 在消息中 @某人（需平台支持）
+【管理】（仅管理员可用，且只能操作本会话的任务）
+  /定时 列表            查看本会话任务（含上次/下次触发与累计次数）
   /定时 编辑 <编号>|<新内容>   修改任务的消息内容
   /定时 改时 <编号>|<新时间>   修改任务的触发时间（支持同样的时间写法）
   /定时 立即 <编号>     手动触发一次（测试用）
   /定时 暂停 <编号>     暂停任务
   /定时 启用 <编号>     恢复任务
   /定时 删除 <编号>     删除任务
-  /定时 帮助            查看帮助"""
+  /定时 帮助            查看帮助
+群聊与私聊均可使用；任务会推送到创建它的那个会话。"""
+
+_AT_PATTERN = re.compile(r"\{\{at:(\d+)\}\}")
 
 
 @dataclass
@@ -80,6 +86,7 @@ class CronPushPlugin(Star):
         self.tasks: dict[int, PushTask] = {}
         self._next_id = 1
         self._loaded = False
+        self._caught_up = False
         self._load_lock = asyncio.Lock()
         self._save_lock = asyncio.Lock()
         self._sched_task: Optional[asyncio.Task] = None
@@ -104,14 +111,17 @@ class CronPushPlugin(Star):
 
     @staticmethod
     def _cmd_text(event: AstrMessageEvent, n: int) -> str:
-        """去掉开头的 n 个指令 token，返回剩余文本。"""
-        s = event.message_str.strip()
+        """去掉开头的 n 个指令 token，返回剩余原文（保留内容中的空格与换行）。"""
+        s = event.message_str.lstrip()
         if s.startswith("/"):
             s = s[1:]
-        parts = s.split()
-        if len(parts) <= n:
-            return ""
-        return " ".join(parts[n:]).strip()
+        for _ in range(n):
+            s = s.lstrip()
+            idx = 0
+            while idx < len(s) and not s[idx].isspace():
+                idx += 1
+            s = s[idx:]
+        return s.strip()
 
     # ---------------- 持久化（KV 存储） ----------------
 
@@ -151,6 +161,51 @@ class CronPushPlugin(Star):
             .replace("{{time}}", now.strftime("%H:%M"))
         )
 
+    def _build_chain(self, tpl: str, now: datetime) -> MessageChain:
+        """构建待发送消息链；含 {{at:QQ}} 时拆分为文本与 @ 消息段。"""
+        text = self._render(tpl, now)
+        if not _AT_PATTERN.search(text):
+            return MessageChain().message(text)
+        try:
+            chain = MessageChain()
+            pos = 0
+            for m in _AT_PATTERN.finditer(text):
+                if m.start() > pos:
+                    chain.append(Plain(text[pos : m.start()]))
+                chain.append(At(qq=m.group(1)))
+                pos = m.end()
+            if pos < len(text):
+                chain.append(Plain(text[pos:]))
+            return chain
+        except Exception as e:
+            logger.warning(f"构建 @ 消息段失败，降级为纯文本：{e}")
+            return MessageChain().message(text)
+
+    async def _notify(self, umo: str, text: str) -> None:
+        """向会话发送提示信息，失败仅记录日志。"""
+        try:
+            await self.context.send_message(umo, MessageChain().message(text))
+        except Exception as e:
+            logger.warning(f"发送通知失败：{e}")
+
+    def _parse_last_fired(self, value: str, now: datetime):
+        """把持久化的 last_fired 还原为与 now 同时区的时间。"""
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=now.tzinfo)
+        except ValueError:
+            return None
+
+    def _resolve_task(self, event: AstrMessageEvent, tid: int):
+        """按编号取任务并校验会话归属，返回 (任务, 错误信息)。"""
+        task = self.tasks.get(tid)
+        if task is None:
+            return None, f"❌ 没有编号为 {tid} 的任务。"
+        if not self._cfg("allow_cross_session", False) and task.umo != event.unified_msg_origin:
+            return None, f"❌ 任务 #{tid} 属于其它会话，无法在此操作。"
+        return task, ""
+
     def _next_fire_str(self, cron: str) -> str:
         try:
             nxt = CronExpr(cron).find_next(self._now())
@@ -179,6 +234,9 @@ class CronPushPlugin(Star):
             try:
                 await self._ensure_loaded()
                 now = self._now()
+                if not self._caught_up:
+                    self._caught_up = True
+                    await self._catch_up(now)
                 key = now.strftime("%Y-%m-%d %H:%M")
                 for t in list(self.tasks.values()):
                     if not t.enabled or t.last_fired == key:
@@ -191,7 +249,7 @@ class CronPushPlugin(Star):
                     if not matched:
                         continue
                     try:
-                        await self.context.send_message(t.umo, MessageChain().message(self._render(t.message, now)))
+                        await self.context.send_message(t.umo, self._build_chain(t.message, now))
                         t.fire_count += 1
                         t.consecutive_failures = 0
                         t.last_fired = key
@@ -204,11 +262,48 @@ class CronPushPlugin(Star):
                             t.enabled = False
                             await self._save_tasks()
                             logger.warning(f"定时任务 #{t.id} 连续失败 {t.consecutive_failures} 次，已自动暂停")
+                            await self._notify(
+                                t.umo,
+                                f"⚠️ 定时任务 #{t.id} 已连续发送失败 {t.consecutive_failures} 次，"
+                                f"为免继续无效重试已自动暂停。\n内容：{t.message[:50]}\n"
+                                f"排查后可发送 /定时 启用 {t.id} 恢复。",
+                            )
                         else:
                             logger.warning(f"定时任务 #{t.id} 执行失败：{e}")
             except Exception:
                 logger.exception("定时任务调度循环异常")
             await asyncio.sleep(max(5, int(self._cfg("check_interval_seconds", 20))))
+
+    async def _catch_up(self, now: datetime) -> None:
+        """补发离线期间错过的任务；每个任务最多补发一次。"""
+        if not self._cfg("catch_up", False):
+            return
+        try:
+            max_hours = max(1, int(self._cfg("catch_up_max_hours", 6)))
+        except Exception:
+            max_hours = 6
+        window_start = now - timedelta(hours=max_hours)
+        for t in list(self.tasks.values()):
+            if not t.enabled:
+                continue
+            start = self._parse_last_fired(t.last_fired, now) or window_start
+            if start < window_start:
+                start = window_start
+            try:
+                missed = CronExpr(t.cron).find_next(start)
+            except Exception:
+                continue
+            if missed is None or missed > now:
+                continue
+            try:
+                await self.context.send_message(t.umo, self._build_chain(t.message, now))
+                t.fire_count += 1
+                t.consecutive_failures = 0
+                t.last_fired = now.strftime("%Y-%m-%d %H:%M")
+                await self._save_tasks()
+                logger.info(f"定时任务 #{t.id} 已补发（错过 {missed:%Y-%m-%d %H:%M}）")
+            except Exception as e:
+                logger.warning(f"定时任务 #{t.id} 补发失败：{e}")
 
     async def terminate(self) -> None:
         """插件停用/卸载时取消调度任务。"""
@@ -223,7 +318,7 @@ class CronPushPlugin(Star):
         pass
 
     @timer_group.command("新增", alias={"添加", "add", "create"})
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def add_task(self, event: AstrMessageEvent):
         """新增定时任务：/定时 新增 <时间>|<消息>"""
@@ -269,7 +364,7 @@ class CronPushPlugin(Star):
         )
 
     @timer_group.command("列表", alias={"list", "查看"})
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def list_tasks(self, event: AstrMessageEvent):
         """查看定时任务"""
         self._ensure_scheduler()
@@ -297,24 +392,27 @@ class CronPushPlugin(Star):
 
     def _task_id(self, event: AstrMessageEvent) -> int:
         """解析任务编号（无效返回 -1）。"""
-        tid = self._cmd_text(event, 2).strip()
-        if not tid.isdigit():
+        parts = self._cmd_text(event, 2).split(maxsplit=1)
+        if not parts or not parts[0].isdigit():
             return -1
-        return int(tid)
+        return int(parts[0])
 
     @timer_group.command("立即", alias={"run", "now"})
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def run_now(self, event: AstrMessageEvent):
         """手动触发一次任务：/定时 立即 <编号>"""
         await self._ensure_loaded()
         tid = self._task_id(event)
-        if tid < 0 or tid not in self.tasks:
-            yield event.plain_result(f"❌ 格式：/定时 立即 <编号>，用 /定时 列表 查看编号。")
+        if tid < 0:
+            yield event.plain_result("❌ 格式：/定时 立即 <编号>，用 /定时 列表 查看编号。")
             return
-        t = self.tasks[tid]
+        t, err = self._resolve_task(event, tid)
+        if t is None:
+            yield event.plain_result(err)
+            return
         try:
-            await self.context.send_message(t.umo, MessageChain().message(self._render(t.message, self._now())))
+            await self.context.send_message(t.umo, self._build_chain(t.message, self._now()))
         except Exception as e:
             yield event.plain_result(f"❌ 发送失败：{e}")
             return
@@ -326,85 +424,105 @@ class CronPushPlugin(Star):
         yield event.plain_result(f"✅ 已手动发送任务 #{tid} 的内容。")
 
     @timer_group.command("暂停", alias={"pause", "stop"})
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def pause_task(self, event: AstrMessageEvent):
         """暂停任务：/定时 暂停 <编号>"""
         await self._ensure_loaded()
         tid = self._task_id(event)
-        if tid < 0 or tid not in self.tasks:
+        if tid < 0:
             yield event.plain_result("❌ 格式：/定时 暂停 <编号>，用 /定时 列表 查看编号。")
             return
-        self.tasks[tid].enabled = False
+        t, err = self._resolve_task(event, tid)
+        if t is None:
+            yield event.plain_result(err)
+            return
+        t.enabled = False
         await self._save_tasks()
         yield event.plain_result(f"⏸ 已暂停任务 #{tid}，发送 /定时 启用 {tid} 恢复。")
 
     @timer_group.command("启用", alias={"resume", "start"})
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def resume_task(self, event: AstrMessageEvent):
         """恢复任务：/定时 启用 <编号>"""
         await self._ensure_loaded()
         tid = self._task_id(event)
-        if tid < 0 or tid not in self.tasks:
+        if tid < 0:
             yield event.plain_result("❌ 格式：/定时 启用 <编号>，用 /定时 列表 查看编号。")
             return
-        self.tasks[tid].enabled = True
-        self.tasks[tid].consecutive_failures = 0
+        t, err = self._resolve_task(event, tid)
+        if t is None:
+            yield event.plain_result(err)
+            return
+        t.enabled = True
+        t.consecutive_failures = 0
         await self._save_tasks()
         yield event.plain_result(f"▶️ 已启用任务 #{tid}。")
 
     @timer_group.command("删除", alias={"del", "remove"})
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def delete_task(self, event: AstrMessageEvent):
         """删除任务：/定时 删除 <编号>"""
         await self._ensure_loaded()
-        tid = self._cmd_text(event, 2).strip()
-        if not tid.isdigit() or int(tid) not in self.tasks:
-            yield event.plain_result(f"❌ 没有编号为 {tid or '空'} 的任务。")
+        tid = self._task_id(event)
+        if tid < 0:
+            yield event.plain_result("❌ 格式：/定时 删除 <编号>，用 /定时 列表 查看编号。")
             return
-        self.tasks.pop(int(tid))
+        t, err = self._resolve_task(event, tid)
+        if t is None:
+            yield event.plain_result(err)
+            return
+        self.tasks.pop(tid)
         await self._save_tasks()
         yield event.plain_result(f"🗑 已删除任务 #{tid}。")
 
     @timer_group.command("编辑", alias={"edit", "改内容"})
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def edit_task(self, event: AstrMessageEvent):
         """修改任务的消息内容：/定时 编辑 <编号>|<新内容>"""
         await self._ensure_loaded()
         arg = self._cmd_text(event, 2)
         id_part, _, payload = arg.partition("|")
-        if not id_part.isdigit() or int(id_part) not in self.tasks or not payload.strip():
+        if not id_part.strip().isdigit() or not payload.strip():
             yield event.plain_result("❌ 格式：/定时 编辑 <编号>|<新内容>，用 /定时 列表 查看编号，新内容不能为空。")
             return
-        self.tasks[int(id_part)].message = payload.strip()
+        t, err = self._resolve_task(event, int(id_part.strip()))
+        if t is None:
+            yield event.plain_result(err)
+            return
+        t.message = payload.strip()
         await self._save_tasks()
-        yield event.plain_result(f"✅ 已更新任务 #{id_part} 的内容。")
+        yield event.plain_result(f"✅ 已更新任务 #{t.id} 的内容。")
 
     @timer_group.command("改时", alias={"resched", "改时间"})
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def resched_task(self, event: AstrMessageEvent):
         """修改任务的触发时间：/定时 改时 <编号>|<新时间>"""
         await self._ensure_loaded()
         arg = self._cmd_text(event, 2)
         id_part, _, payload = arg.partition("|")
-        if not id_part.isdigit() or int(id_part) not in self.tasks or not payload.strip():
+        if not id_part.strip().isdigit() or not payload.strip():
             yield event.plain_result("❌ 格式：/定时 改时 <编号>|<新时间>，例如：/定时 改时 3|每日 09:00")
+            return
+        t, err = self._resolve_task(event, int(id_part.strip()))
+        if t is None:
+            yield event.plain_result(err)
             return
         try:
             new_cron = parse_schedule(payload.strip())
         except ValueError as e:
             yield event.plain_result(f"❌ {e}")
             return
-        self.tasks[int(id_part)].cron = new_cron
+        t.cron = new_cron
         await self._save_tasks()
-        yield event.plain_result(f"✅ 已更新任务 #{id_part} 的触发时间（cron：{new_cron}）。")
+        yield event.plain_result(f"✅ 已更新任务 #{t.id} 的触发时间（cron：{new_cron}）。")
 
     @timer_group.command("帮助", alias={"help"})
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(filter.EventMessageType.ALL)
     async def help_cmd(self, event: AstrMessageEvent):
         """查看帮助"""
         yield event.plain_result(HELP_TEXT)

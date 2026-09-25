@@ -12,6 +12,7 @@ class CronExpr:
 
     周字段：0 或 7 表示周日，1-6 表示周一~周六。
     支持 *、n、a-b、*/n、a-b/n、a,b,c 语法。
+    越界或非数字取值会抛 ValueError，避免产生「永不触发」的静默任务。
     """
 
     def __init__(self, expr: str):
@@ -19,15 +20,35 @@ class CronExpr:
         if len(fields) != 5:
             raise ValueError("cron 表达式需为 5 段（分 时 日 月 周），例如：0 8 * * *")
         self.expr = expr
-        self.minute = self._parse(fields[0], 0, 59)
-        self.hour = self._parse(fields[1], 0, 23)
-        self.day = self._parse(fields[2], 1, 31)
-        self.month = self._parse(fields[3], 1, 12)
-        self.week = {0 if v == 7 else v for v in self._parse(fields[4], 0, 7)}
+        self.minute = self._parse(fields[0], 0, 59, "分")
+        self.hour = self._parse(fields[1], 0, 23, "时")
+        self.day = self._parse(fields[2], 1, 31, "日")
+        self.month = self._parse(fields[3], 1, 12, "月")
+        # 归一化：7 与 0 同为周日，因此 * 展开后落在 0-6 共 7 个取值
+        self.week = {0 if v == 7 else v for v in self._parse(fields[4], 0, 7, "周")}
 
     @staticmethod
-    def _parse(field: str, lo: int, hi: int) -> set[int]:
+    def _int(token: str, label: str) -> int:
+        try:
+            return int(token.strip())
+        except ValueError:
+            raise ValueError(f"cron 的{label}字段包含非数字内容：{token.strip()!r}") from None
+
+    @classmethod
+    def _parse(cls, field: str, lo: int, hi: int, label: str) -> set[int]:
         result: set[int] = set()
+
+        def add(value: int) -> None:
+            if not lo <= value <= hi:
+                raise ValueError(f"cron 的{label}字段数值 {value} 超出范围（{lo}-{hi}）")
+            result.add(value)
+
+        def add_range(start: int, stop: int, step: int = 1) -> None:
+            if start > stop:
+                raise ValueError(f"cron 的{label}字段区间起点大于终点：{start}-{stop}")
+            for value in range(start, stop + 1, step):
+                add(value)
+
         for part in field.split(","):
             part = part.strip()
             if not part:
@@ -36,33 +57,33 @@ class CronExpr:
                 result.update(range(lo, hi + 1))
                 continue
             if "/" in part:
-                base, step = part.split("/", 1)
-                step = int(step)
+                base, _, step_text = part.partition("/")
+                step = cls._int(step_text, label)
                 if step <= 0:
-                    raise ValueError(f"无效的步长：{part}")
-                if base == "*":
+                    raise ValueError(f"cron 的{label}字段步长需大于 0：{part}")
+                if base.strip() == "*":
                     result.update(range(lo, hi + 1, step))
                 elif "-" in base:
-                    a, b = base.split("-", 1)
-                    result.update(range(int(a), int(b) + 1, step))
+                    a, _, b = base.partition("-")
+                    add_range(cls._int(a, label), cls._int(b, label), step)
                 else:
-                    result.update(range(int(base), hi + 1, step))
+                    add_range(cls._int(base, label), hi, step)
             elif "-" in part:
-                a, b = part.split("-", 1)
-                result.update(range(int(a), int(b) + 1))
+                a, _, b = part.partition("-")
+                add_range(cls._int(a, label), cls._int(b, label))
             else:
-                result.add(int(part))
-        return {v for v in result if lo <= v <= hi}
+                add(cls._int(part, label))
 
-    def match(self, dt: datetime) -> bool:
-        if dt.minute not in self.minute:
-            return False
-        if dt.hour not in self.hour:
-            return False
+        if not result:
+            raise ValueError(f"cron 的{label}字段没有任何有效取值：{field!r}")
+        return result
+
+    def _day_matches(self, dt: datetime) -> bool:
+        """判断日/月/周是否命中（不含时分）。"""
         if dt.month not in self.month:
             return False
-        day_all = len(self.day) == 31  # 日字段为 *
-        week_all = len(self.week) == 8  # 周字段为 *（0..7）
+        day_all = len(self.day) == 31
+        week_all = len(self.week) == 7
         wd = (dt.weekday() + 1) % 7  # 周一=1 ... 周日=0
         day_match = day_all or (dt.day in self.day)
         week_match = week_all or (wd in self.week)
@@ -71,15 +92,28 @@ class CronExpr:
             return day_match or week_match
         return day_match and week_match
 
-    def find_next(self, dt: datetime, limit_days: int = 366):
-        """返回从 dt（含）之后、最接近的下一个触发时刻；找不到返回 None。"""
-        d = dt.replace(second=0, microsecond=0)
-        end = d + timedelta(days=limit_days)
-        d += timedelta(minutes=1)
-        while d <= end:
-            if self.match(d):
-                return d
-            d += timedelta(minutes=1)
+    def match(self, dt: datetime) -> bool:
+        if dt.minute not in self.minute:
+            return False
+        if dt.hour not in self.hour:
+            return False
+        return self._day_matches(dt)
+
+    def find_next(self, dt: datetime, limit_days: int = 2923):
+        """返回 dt 所在分钟之后、最接近的触发时刻；找不到返回 None。
+
+        按天跳过不可能命中的日期，避免逐分钟扫描整年。
+        搜索上限取 8 年，足以覆盖闰日（2/29）这类最长 4 年周期。
+        """
+        cur = dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        end = cur + timedelta(days=limit_days)
+        while cur <= end:
+            if not self._day_matches(cur):
+                cur = (cur + timedelta(days=1)).replace(hour=0, minute=0)
+                continue
+            if cur.hour in self.hour and cur.minute in self.minute:
+                return cur
+            cur += timedelta(minutes=1)
         return None
 
 
